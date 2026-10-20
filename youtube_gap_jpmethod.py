@@ -13,6 +13,9 @@ YouTube 調査:「日本式○○」「日本の暮らし」を英語で発信�
      小さい/新しいチャンネルが取っている再生の割合(取り分)を中心にする
 
 使い方:環境変数 YT_API_KEY にAPIキーを入れて python3 youtube_gap_jpmethod.py
+  ・キーワードごとに jpmethod_progress.json に途中結果を保存する。
+    1日の上限で止まっても、上限が戻った後に同じコマンドで続きから再開できる。
+  ・最初からやり直したいときは jpmethod_progress.json を消してから実行する。
 出力:
   jpmethod_summary.csv … キーワードごとの集計(直近/過去、取り分、相対トレンド)
   jpmethod_videos.csv  … 集めた動画の一覧(元データ)
@@ -67,6 +70,11 @@ SMALL_CHANNEL_SUBS = 10_000
 NEW_CHANNEL_DAYS = 730
 SHORTS_MAX_SECONDS = 180
 API = "https://www.googleapis.com/youtube/v3/"
+PROGRESS_FILE = "jpmethod_progress.json"   # キーワードごとの途中結果(上限で止まっても消えない)
+
+
+class QuotaReached(Exception):
+    pass
 
 
 def call(endpoint, params, key):
@@ -77,8 +85,8 @@ def call(endpoint, params, key):
             return json.load(r)
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", "replace")
-        if "quotaExceeded" in body:
-            sys.exit("APIの1日の上限に達しました。明日もう一度実行してください。")
+        if any(k in body for k in ("quotaExceeded", "rateLimitExceeded", "dailyLimitExceeded", "userRateLimitExceeded")):
+            raise QuotaReached()
         sys.exit(f"APIエラー ({e.code}): {body[:500]}")
 
 
@@ -162,21 +170,51 @@ def summarize(rows):
     }
 
 
+def load_progress():
+    if os.path.exists(PROGRESS_FILE):
+        with open(PROGRESS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    return {"results": {}, "rows": {}}
+
+
+def save_progress(p):
+    tmp = PROGRESS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(p, f, ensure_ascii=False)
+    os.replace(tmp, PROGRESS_FILE)
+
+
 def main():
     key = os.environ.get("YT_API_KEY") or input("YouTube APIキーを入力してください: ").strip()
     if not key:
         sys.exit("APIキーがありません。")
 
-    all_rows, results = [], []
+    progress = load_progress()
+    done = set(progress["results"])
+    if done:
+        print(f"途中結果を読み込みました:{len(done)}/{len(KEYWORDS)} キーワード取得済み。続きから再開します。")
+
     for i, kw in enumerate(KEYWORDS, 1):
+        if kw in done:
+            continue
         print(f"[{i}/{len(KEYWORDS)}] {kw}")
-        res = {"keyword": kw}
-        for window in ("recent", "older"):
-            rows = collect(kw, window, key)
-            all_rows.extend(rows)
-            for k, v in summarize(rows).items():
-                res[f"{window}_{k}"] = v
-        results.append(res)
+        res, rows_kw = {"keyword": kw}, []
+        try:
+            for window in ("recent", "older"):
+                rows = collect(kw, window, key)
+                rows_kw.extend(rows)
+                for k, v in summarize(rows).items():
+                    res[f"{window}_{k}"] = v
+        except QuotaReached:
+            save_progress(progress)
+            sys.exit(f"APIの1日の上限に達しました。{len(progress['results'])}/{len(KEYWORDS)} キーワード分は保存済みです。"
+                     "上限が戻る日本時間16時ごろ(太平洋時間の0時)以降に、同じコマンドをもう一度実行すれば続きから再開します。")
+        progress["results"][kw] = res
+        progress["rows"][kw] = rows_kw
+        save_progress(progress)
+
+    results = [progress["results"][kw] for kw in KEYWORDS if kw in progress["results"]]
+    all_rows = [r for kw in KEYWORDS for r in progress["rows"].get(kw, [])]
 
     ratios = [r["recent_median_vpd"] / r["older_median_vpd"]
               for r in results if r.get("older_median_vpd") and r.get("recent_median_vpd")]
